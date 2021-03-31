@@ -63,16 +63,20 @@ public:
         return _finished;
     };
 
-    void write_async(uint16_t address, uint8_t* buffer, size_t num_bytes, bool send_stop) override {
+    size_t get_bytes_transferred() {
+        return -1;
+    }
+
+    void write_async(uint8_t address, uint8_t* buffer, size_t num_bytes, bool send_stop) override {
         copy_to_next_buffer(false, address, buffer, num_bytes, send_stop);
     };
 
-    void read_async(uint16_t address, uint8_t* buffer, size_t num_bytes, bool send_stop) override {
+    void read_async(uint8_t address, uint8_t* buffer, size_t num_bytes, bool send_stop) override {
         memcpy(buffer, read_data, num_bytes);
         copy_to_next_buffer(true, address, buffer, num_bytes, send_stop);
     };
 
-    void copy_to_next_buffer(bool read, uint16_t address, uint8_t* buffer, size_t num_bytes, bool send_stop){
+    void copy_to_next_buffer(bool read, uint8_t address, uint8_t* buffer, size_t num_bytes, bool send_stop){
         if(next_buffer < size_t(buffers)) {
             buffers[next_buffer++].set(read, address, buffer, num_bytes, send_stop);
         }

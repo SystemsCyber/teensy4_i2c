@@ -1,4 +1,4 @@
-// Copyright © 2019 Richard Gemmell
+// Copyright © 2019-2020 Richard Gemmell
 // Released under the MIT License. See license.txt. (https://opensource.org/licenses/MIT)
 
 #ifndef IMX_RT1060_I2C_DRIVER_H
@@ -45,7 +45,7 @@ public:
         }
     }
 
-    inline size_t get_bytes_written() {
+    inline size_t get_bytes_transferred() {
         return next_index;
     }
 
@@ -62,7 +62,7 @@ public:
         return next_index == size;
     }
 
-    inline bool not_stated_reading() {
+    inline bool not_started_reading() {
         return next_index == 0;
     }
 
@@ -118,9 +118,11 @@ public:
 
     bool finished() override;
 
-    void write_async(uint16_t address, uint8_t* buffer, size_t num_bytes, bool send_stop) override;
+    size_t get_bytes_transferred() override;
 
-    void read_async(uint16_t address, uint8_t* buffer, size_t num_bytes, bool send_stop) override;
+    void write_async(uint8_t address, uint8_t* buffer, size_t num_bytes, bool send_stop) override;
+
+    void read_async(uint8_t address, uint8_t* buffer, size_t num_bytes, bool send_stop) override;
 
     // DO NOT call this method directly.
     void _interrupt_service_routine();
@@ -148,15 +150,15 @@ private:
     void (* isr)();
     void set_clock(uint32_t frequency);
     void abort_transaction_async();
-    bool start(uint16_t address, uint32_t direction);
+    bool start(uint8_t address, uint32_t direction);
     uint8_t tx_fifo_count();
     uint8_t rx_fifo_count();
     void clear_all_msr_flags();
 };
 
-extern IMX_RT1060_I2CMaster Master;
-extern IMX_RT1060_I2CMaster Master1;
-extern IMX_RT1060_I2CMaster Master2;
+extern IMX_RT1060_I2CMaster Master;     // Pins 19 and 18; SCL0 and SDA0
+extern IMX_RT1060_I2CMaster Master1;    // Pins 16 and 17; SCL1 and SDA1
+extern IMX_RT1060_I2CMaster Master2;    // Pins 24 and 25; SCL2 and SDA2
 
 class IMX_RT1060_I2CSlave : public I2CSlave
 {
@@ -165,7 +167,11 @@ public:
             : port(port), config(config), isr(isr) {
     }
 
-    void listen(uint16_t address) override;
+    void listen(uint8_t address) override;
+
+    void listen(uint8_t first_address, uint8_t second_address) override;
+
+    void listen_range(uint8_t first_address, uint8_t last_address) override;
 
     void stop_listening() override;
 
@@ -180,11 +186,11 @@ public:
         port->SCR = LPI2C_SCR_SEN;
     }
 
-    void after_receive(std::function<void(int len)> callback) override;
+    void after_receive(std::function<void(size_t length, uint16_t address)> callback) override;
 
-    void before_transmit(std::function<void()> callback) override;
+    void before_transmit(std::function<void(uint16_t address)> callback) override;
 
-    void after_transmit(std::function<void()> callback) override;
+    void after_transmit(std::function<void(uint16_t address)> callback) override;
 
     void set_transmit_buffer(uint8_t* buffer, size_t size) override;
 
@@ -207,22 +213,25 @@ private:
     IMXRT_LPI2C_Registers* const port;
     IMX_RT1060_I2CBase::Config& config;
     volatile State state = State::idle;
+    volatile uint16_t address_called = 0;
 
     I2CBuffer rx_buffer = I2CBuffer();
     I2CBuffer tx_buffer = I2CBuffer();
     bool trailing_byte_sent = false;
 
     void (* isr)();
-    std::function<void(int len)> after_receive_callback = nullptr;
-    std::function<void()> before_transmit_callback = nullptr;
-    std::function<void()> after_transmit_callback = nullptr;
+    std::function<void(size_t length, uint16_t address)> after_receive_callback = nullptr;
+    std::function<void(uint16_t address)> before_transmit_callback = nullptr;
+    std::function<void(uint16_t address)> after_transmit_callback = nullptr;
+
+    void listen(uint32_t samr, uint32_t address_config);
 
     // Called from within the ISR when we receive a Repeated START or STOP
     void end_of_frame();
 };
 
-extern IMX_RT1060_I2CSlave Slave;
-extern IMX_RT1060_I2CSlave Slave1;
-extern IMX_RT1060_I2CSlave Slave2;
+extern IMX_RT1060_I2CSlave Slave;   // Pins 19 and 18; SCL0 and SDA0
+extern IMX_RT1060_I2CSlave Slave1;  // Pins 16 and 17; SCL1 and SDA1
+extern IMX_RT1060_I2CSlave Slave2;  // Pins 24 and 25; SCL2 and SDA2
 
 #endif //IMX_RT1060_I2C_DRIVER_H

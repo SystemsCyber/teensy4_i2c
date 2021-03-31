@@ -4,7 +4,7 @@
 // Demonstrates use of the raw I2C driver as a slave receiver.
 // Receives data from a master device.
 //
-// To use it, connect a master to the Teensy on pins 18 and 19.
+// To use it, connect a master to the Teensy on pins 16 and 17.
 // Use the master to write to the Teensy.
 //
 // This is an advanced example. Use the "simple" examples
@@ -20,9 +20,9 @@ IntervalTimer blink_timer;
 volatile bool led_high = false;
 void blink_isr();
 
-const uint16_t slave_address = 0x002D;
-I2CSlave& slave = Slave;
-void after_receive(int size);
+const uint8_t slave_address = 0x2D;
+I2CSlave& slave = Slave1;
+void after_receive(size_t length, uint16_t address);
 
 // Double receive buffers to hold data from master.
 const size_t slave_rx_buffer_size = 4;
@@ -70,13 +70,13 @@ void loop() {
 // Called by the I2C interrupt service routine.
 // This method must be as fast as possible.
 // Do not perform IO in it.
-void after_receive(int size) {
+void after_receive(size_t length, uint16_t address) {
     // This is the only time we can guarantee that the
     // receive buffer is not changing.
     // Copy the content so we can handle it in the main loop.
     if (!slave_bytes_received) {
-        memcpy(slave_rx_buffer_2, slave_rx_buffer, size);
-        slave_bytes_received = size;
+        memcpy(slave_rx_buffer_2, slave_rx_buffer, length);
+        slave_bytes_received = length;
     }
     // else ignore this message because the main loop hasn't
     // handled the previous one yet.

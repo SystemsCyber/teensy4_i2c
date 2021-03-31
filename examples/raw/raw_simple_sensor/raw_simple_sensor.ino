@@ -1,11 +1,12 @@
-// Copyright © 2019 Richard Gemmell
+// Copyright © 2019-2020 Richard Gemmell
 // Released under the MIT License. See license.txt. (https://opensource.org/licenses/MIT)
 
 // A Simple Sensor
 // Demonstrates use of the raw I2C driver as a simple slave transmitter.
 // The sensor provides the master with a simulated temperature reading
-// on demand.
-// To use it, connect a master to the Teensy on pins 18 and 19.
+// on demand. The temperature increases each time the master reads it.
+//
+// To use it, connect a master to the Teensy on pins 16 and 17.
 // Send read requests to the Teensy.
 //
 // This is an advanced example. Use the "simple" examples
@@ -21,10 +22,11 @@ IntervalTimer blink_timer;
 volatile bool led_high = false;
 void blink_isr();
 
-const uint16_t slave_address = 0x002D;
-I2CSlave& slave = Slave;
-void before_transmit_isr();
-void after_transmit();
+const uint8_t slave_address = 0x2D;
+I2CSlave& slave = Slave1;
+void set_temp(uint16_t new_temp);
+void before_transmit_isr(uint16_t address);
+void after_transmit(uint16_t address);
 
 // Set up transmit buffer and temperature value
 const size_t tx_buffer_size = 2;
@@ -46,6 +48,9 @@ void setup() {
     // Create a timer to blink the LED
     blink_timer.begin(blink_isr, 500 * 1000);
 
+    // Initialise the data we'll send to the master
+    set_temp(fake_temp);
+
     // Configure I2C Slave and Start It
     slave.before_transmit(before_transmit_isr);
     slave.after_transmit(after_transmit);
@@ -58,10 +63,6 @@ void setup() {
 }
 
 void loop() {
-    // Work out the current temperature and make it available to the master
-    fake_temp++;
-    memcpy(tx_buffer, &fake_temp, sizeof(fake_temp));
-
     // Now we've got the time, we can handle the results of the ISR callbacks.
     log_transmit_events();
 
@@ -69,15 +70,22 @@ void loop() {
     delay(2);
 }
 
+// Sets the value that will be returned to the master
+void set_temp(uint16_t new_temp) {
+    memcpy(tx_buffer, &new_temp, sizeof(new_temp));
+    Serial.print("Setting temperature to ");
+    Serial.println(new_temp);
+}
+
 // Called by an interrupt service routine.
 // This function must be _very_ fast. Avoid IO.
-void before_transmit_isr() {
+void before_transmit_isr(uint16_t address) {
     before_transmit_received = true;
 }
 
 // Called by an interrupt service routine.
 // This function must be _very_ fast. Avoid IO.
-void after_transmit() {
+void after_transmit(uint16_t address) {
     after_transmit_received = true;
     if (slave.has_error()) {
         I2CError error = slave.error();
@@ -101,6 +109,10 @@ void log_transmit_events() {
             Serial.println("App: Buffer Underflow. (Master asked for too many bytes.)");
             buffer_underflow_detected = false;
         }
+        Serial.println();
+
+        // Use a new temperature
+        set_temp(++fake_temp);
     }
 }
 

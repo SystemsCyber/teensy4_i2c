@@ -1,4 +1,4 @@
-// Copyright © 2019 Richard Gemmell
+// Copyright © 2019-2020 Richard Gemmell
 // Released under the MIT License. See license.txt. (https://opensource.org/licenses/MIT)
 
 #ifndef I2C_DRIVER_H
@@ -29,6 +29,8 @@ enum class I2CError {
 // Contains behaviour that's common to both masters and slaves.
 class I2CDriver {
 public:
+    explicit I2CDriver();
+
     // Indicates whether the driver is working or what happened
     // in the last read/write
     inline I2CError error() {
@@ -39,8 +41,21 @@ public:
     inline bool has_error() {
         return _error > I2CError::ok;
     }
+
+    // Sets the pad control configuration that will be used for the I2C pins.
+    // This enables the built in pull up resistor and sets the pin impedance etc.
+    // You must call this method before calling begin() or listen().
+    //
+    // The default is PAD_CONTROL_CONFIG defined in imx_rt1060_i2c_driver.cpp.
+    // You may need to override the default implementation to tune the pad driver's
+    // impedance etc. See imx_rt1060_i2c_driver.cpp for details.
+    inline void set_pad_control_configuration(uint32_t config) {
+        pad_control_config = config;
+    }
+
 protected:
     volatile I2CError _error = I2CError::ok;
+    uint32_t pad_control_config;
 };
 
 class I2CMaster : public I2CDriver {
@@ -62,13 +77,17 @@ public:
     // True when it's Ok to do another read or write
     virtual bool finished() = 0;
 
+    // Returns the number of bytes transferred by the last call to
+    // write_async or read_async.
+    virtual size_t get_bytes_transferred() = 0;
+
     // Transmits the contents of buffer to the slave at the given address.
     // The caller must not modify the buffer until the read is complete.
     // Set 'num_bytes' to 0 to find out if there's a slave listening on this address.
     // Set 'send_stop' to true if this is the last transfer in the transaction.
     // Set 'send_stop' to false if are going to make another transfer.
     // Call finished() to see if the call has finished.
-    virtual void write_async(uint16_t address, uint8_t* buffer, size_t num_bytes, bool send_stop) = 0;
+    virtual void write_async(uint8_t address, uint8_t* buffer, size_t num_bytes, bool send_stop) = 0;
 
     // Reads the specified number of bytes and copies them into the supplied buffer.
     // The caller must not modify the buffer until the read is complete.
@@ -76,17 +95,28 @@ public:
     // Set 'send_stop' to true if this is the last transfer in the transaction.
     // Set 'send_stop' to false if are going to make another transfer.
     // Call finished() to see if the call has finished.
-    virtual void read_async(uint16_t address, uint8_t* buffer, size_t num_bytes, bool send_stop) = 0;
+    virtual void read_async(uint8_t address, uint8_t* buffer, size_t num_bytes, bool send_stop) = 0;
 };
 
 class I2CSlave : public I2CDriver {
 public:
     // Start listening to the master on the given address. Makes the slave visible on the bus.
-    virtual void listen(uint16_t address) = 0;
+    virtual void listen(uint8_t address) = 0;
+
+    // Like listen(uint8_t) except that the slave will listen on 2 different I2C addresses.
+    // This makes it appear as 2 devices to the master.
+    virtual void listen(uint8_t first_address, uint8_t second_address) = 0;
+
+    // Like listen(uint8_t) except that the slave will listen on every address
+    // in the range first_address to last_address inclusive.
+    virtual void listen_range(uint8_t first_address, uint8_t last_address) = 0;
 
     // Sets a callback to be called by the ISR each time
     // the slave receives a block of data from the master.
-    virtual void after_receive(std::function<void(int len)> callback) = 0;
+    // 'length' is the number of bytes that were received by the slave
+    // 'address' is the address that the master called. This is only
+    // useful when the slave is listening on multiple addresses.
+    virtual void after_receive(std::function<void(size_t length, uint16_t address)> callback) = 0;
 
     // Detach from the bus. The slave will no longer be visible to the master.
     // Does nothing unless the slave is listening.
@@ -94,11 +124,15 @@ public:
 
     // Sets a callback to be called by the ISR just before
     // the slave transmits a block of data to the master.
-    virtual void before_transmit(std::function<void()> callback) = 0;
+    // 'address' is the address that the master called. This is only
+    // useful when the slave is listening on multiple addresses.
+    virtual void before_transmit(std::function<void(uint16_t address)> callback) = 0;
 
     // Sets a callback to be called by the ISR each time
     // each time the slave has sent a block of data to the master.
-    virtual void after_transmit(std::function<void()> callback) = 0;
+    // 'address' is the address that the master called. This is only
+    // useful when the slave is listening on multiple addresses.
+    virtual void after_transmit(std::function<void(uint16_t address)> callback) = 0;
 
     // Determines which data will be sent to the master the next time
     // it reads from us.

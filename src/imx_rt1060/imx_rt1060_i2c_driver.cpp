@@ -1,4 +1,4 @@
-// Copyright © 2019 Richard Gemmell
+// Copyright © 2019-2020 Richard Gemmell
 // Released under the MIT License. See license.txt. (https://opensource.org/licenses/MIT)
 //
 // Fragments of this code copied from WireIMXRT.cpp © Paul Stoffregen.
@@ -20,6 +20,7 @@
 #define MASTER_READ 1   // Makes the address a read request
 #define MASTER_WRITE 0  // Makes the address a write request
 #define MAX_MASTER_READ_LENGTH 256  // Maximum number of bytes that can be read by a single Master read
+#define CLOCK_STRETCH_TIMEOUT 15000 // Timeout if a device stretches SCL this long, in microseconds
 
 // Debug tools
 #ifdef DEBUG_I2C
@@ -33,22 +34,69 @@ static uint8_t empty_buffer[0];
 I2CBuffer::I2CBuffer() : buffer(empty_buffer) {
 }
 
-static void initialise_pin(IMX_RT1060_I2CBase::PinInfo pin) {
-    *(portControlRegister(pin.pin)) |= IOMUXC_PAD_PKE | IOMUXC_PAD_PUE | IOMUXC_PAD_PUS(3);
+// NXP document the pad configuration in AN5078.pdf Rev 0.
+// https://www.nxp.com/docs/en/application-note/AN5078.pdf
+//
+// DSE - (Drive Strength Enable) - See AN5078.pdf section 7.1
+// Used to tune the output driver's impedance to match the load impedance.
+// If the impedance is too high the circuit behaves like a low pass filter,
+// rounding off the inputs.
+// Suggested Value: IOMUXC_PAD_DSE(4) // 37 Ohm
+//
+// SPEED - See AN5078.pdf section 7.3
+// "These options can either increase the output driver current in the higher
+// frequency range, or reduce the switching noise in the lower frequency range."
+// Suggested Value: IOMUXC_PAD_SPEED(1) // 100MHz
+//
+// SRE - Slew Rate Field - See AN5078.pdf section 7.2
+// NXP recommend that this option should be disabled for I2C
+// Suggested Value: disabled. Add IOMUXC_PAD_SRE to enable
+//
+// Pull/keeper - See AN5078.pdf sections 6 and 8.2.2
+// AN5078 recommends disabling pullup except for "very low clock frequencies"
+// Suggested Value: IOMUXC_PAD_PKE | IOMUXC_PAD_PUE | IOMUXC_PAD_PUS(3) // Enable 22k pullup resistor
+//
+// Enable Open Drain - See AN5078.pdf sections 5.2
+// Recommended for I2C as I2C depends on open drain drivers
+// Suggested Value: IOMUXC_PAD_ODE  // Enabled
+//
+// Hysteresis - See AN5078.pdf section 7.2
+// Reduces the number of false input signal changes (glitches) caused by noise
+// near the centre point of the voltage range. Enabling this option on "slightly
+// increases the pin power consumption as well as the propagation delay by
+// several nanoseconds." (From AN5078)
+// Suggested Value: IOMUXC_PAD_HYS  // Enabled
+#define PAD_CONTROL_CONFIG \
+    IOMUXC_PAD_DSE(4) \
+    | IOMUXC_PAD_SPEED(1) \
+    | IOMUXC_PAD_PKE | IOMUXC_PAD_PUE | IOMUXC_PAD_PUS(3) \
+    | IOMUXC_PAD_ODE \
+    | IOMUXC_PAD_HYS
+I2CDriver::I2CDriver()
+    : pad_control_config(PAD_CONTROL_CONFIG) {
+}
+
+static void initialise_pin(IMX_RT1060_I2CBase::PinInfo pin, uint32_t pad_control_config) {
+    *(portControlRegister(pin.pin)) = pad_control_config;
+    #ifdef DEBUG_I2C
+    Serial.print("Pad control register: 0x");
+    Serial.println(*(portControlRegister(pin.pin)), 16);
+    #endif
+
     *(portConfigRegister(pin.pin)) = pin.mux_val;
     if (pin.select_input_register) {
         *(pin.select_input_register) = pin.select_val;
     }
 }
 
-static void initialise_common(IMX_RT1060_I2CBase::Config hardware) {
+static void initialise_common(IMX_RT1060_I2CBase::Config hardware, uint32_t pad_control_config) {
     // Set LPI2C Clock to 24MHz. Required by slaves as well as masters.
     CCM_CSCDR2 = (CCM_CSCDR2 & ~CCM_CSCDR2_LPI2C_CLK_PODF(63)) | CCM_CSCDR2_LPI2C_CLK_SEL;
     hardware.clock_gate_register |= hardware.clock_gate_mask;
 
     // Setup SDA and SCL pins and registers
-    initialise_pin(hardware.sda_pin);
-    initialise_pin(hardware.scl_pin);
+    initialise_pin(hardware.sda_pin, pad_control_config);
+    initialise_pin(hardware.scl_pin, pad_control_config);
 }
 
 static void stop(IMXRT_LPI2C_Registers* port, IRQ_NUMBER_t irq) {
@@ -74,7 +122,7 @@ void IMX_RT1060_I2CMaster::begin(uint32_t frequency) {
     stop(port, config.irq);
 
     // Setup pins and master clock
-    initialise_common(config);
+    initialise_common(config, pad_control_config);
 
     // Configure and Enable Master Mode
     // Set FIFO watermarks. Determines when the RDF and TDF interrupts happen
@@ -84,8 +132,6 @@ void IMX_RT1060_I2CMaster::begin(uint32_t frequency) {
     attachInterruptVector(config.irq, isr);
     port->MIER = LPI2C_MIER_RDIE | LPI2C_MIER_SDIE | LPI2C_MIER_NDIE | LPI2C_MIER_ALIE | LPI2C_MIER_FEIE | LPI2C_MIER_PLTIE;
     NVIC_ENABLE_IRQ(config.irq);
-    // Enable master
-//    port->MCR = LPI2C_MCR_MEN;
 }
 
 void IMX_RT1060_I2CMaster::end() {
@@ -96,7 +142,11 @@ inline bool IMX_RT1060_I2CMaster::finished() {
     return state >= State::idle;
 }
 
-void IMX_RT1060_I2CMaster::write_async(uint16_t address, uint8_t* buffer, size_t num_bytes, bool send_stop) {
+size_t IMX_RT1060_I2CMaster::get_bytes_transferred() {
+    return buff.get_bytes_transferred();
+}
+
+void IMX_RT1060_I2CMaster::write_async(uint8_t address, uint8_t* buffer, size_t num_bytes, bool send_stop) {
     if (!start(address, MASTER_WRITE)) {
         return;
     }
@@ -113,7 +163,7 @@ void IMX_RT1060_I2CMaster::write_async(uint16_t address, uint8_t* buffer, size_t
     port->MIER |= LPI2C_MIER_TDIE;
 }
 
-void IMX_RT1060_I2CMaster::read_async(uint16_t address, uint8_t* buffer, size_t num_bytes, bool send_stop) {
+void IMX_RT1060_I2CMaster::read_async(uint8_t address, uint8_t* buffer, size_t num_bytes, bool send_stop) {
     if (num_bytes > MAX_MASTER_READ_LENGTH) {
         _error = I2CError::invalid_request;
         return;
@@ -190,7 +240,7 @@ void IMX_RT1060_I2CMaster::_interrupt_service_routine() {
 
     if (msr & LPI2C_MSR_RDF) {
         if (ignore_tdf) {
-            if (buff.not_stated_reading()) {
+            if (buff.not_started_reading()) {
                 _error = I2CError::ok;
                 state = State::transferring;
             }
@@ -255,7 +305,7 @@ inline void IMX_RT1060_I2CMaster::clear_all_msr_flags() {
                   LPI2C_MSR_EPF | LPI2C_MSR_RDF | LPI2C_MSR_TDF);
 }
 
-bool IMX_RT1060_I2CMaster::start(uint16_t address, uint32_t direction) {
+bool IMX_RT1060_I2CMaster::start(uint8_t address, uint32_t direction) {
     if (!finished()) {
         // We haven't completed the previous transaction yet
         #ifdef DEBUG_I2C
@@ -336,39 +386,63 @@ void IMX_RT1060_I2CMaster::set_clock(uint32_t frequency) {
                       LPI2C_MCCR0_DATAVD(25) | LPI2C_MCCR0_SETHOLD(40);
         port->MCFGR1 = LPI2C_MCFGR1_PRESCALE(1);
         port->MCFGR2 = LPI2C_MCFGR2_FILTSDA(5) | LPI2C_MCFGR2_FILTSCL(5) |
-                       LPI2C_MCFGR2_BUSIDLE(3900);
+                       LPI2C_MCFGR2_BUSIDLE(2 * (59 + 40 + 2)); // Min BUSIDLE = (CLKLO+SETHOLD+2) × 2
+        port->MCFGR3 = LPI2C_MCFGR3_PINLOW(CLOCK_STRETCH_TIMEOUT * 12 / 256 + 1);
     } else if (frequency < 1000000) {
         // Use Fast Mode - up to 400 kHz
         port->MCCR0 = LPI2C_MCCR0_CLKHI(26) | LPI2C_MCCR0_CLKLO(28) |
                       LPI2C_MCCR0_DATAVD(12) | LPI2C_MCCR0_SETHOLD(18);
         port->MCFGR1 = LPI2C_MCFGR1_PRESCALE(0);
         port->MCFGR2 = LPI2C_MCFGR2_FILTSDA(2) | LPI2C_MCFGR2_FILTSCL(2) |
-                       LPI2C_MCFGR2_BUSIDLE(3900);
+                       LPI2C_MCFGR2_BUSIDLE(2 * (28 + 18 + 2)); // Min BUSIDLE = (CLKLO+SETHOLD+2) × 2
+        port->MCFGR3 = LPI2C_MCFGR3_PINLOW(CLOCK_STRETCH_TIMEOUT * 24 / 256 + 1);
     } else {
         // Use Fast Mode Plus - up to 1 MHz
         port->MCCR0 = LPI2C_MCCR0_CLKHI(9) | LPI2C_MCCR0_CLKLO(10) |
                       LPI2C_MCCR0_DATAVD(4) | LPI2C_MCCR0_SETHOLD(7);
         port->MCFGR1 = LPI2C_MCFGR1_PRESCALE(0);
         port->MCFGR2 = LPI2C_MCFGR2_FILTSDA(1) | LPI2C_MCFGR2_FILTSCL(1) |
-                       LPI2C_MCFGR2_BUSIDLE(3900);
+                       LPI2C_MCFGR2_BUSIDLE(2 * (10 + 7 + 2)); // Min BUSIDLE = (CLKLO+SETHOLD+2) × 2
+        port->MCFGR3 = LPI2C_MCFGR3_PINLOW(CLOCK_STRETCH_TIMEOUT * 24 / 256 + 1);
     }
     port->MCCR1 = port->MCCR0;
-    port->MCFGR3 = LPI2C_MCFGR3_PINLOW(3900);   // Pin low timeout
 }
 
-void IMX_RT1060_I2CSlave::listen(uint16_t address) {
+void IMX_RT1060_I2CSlave::listen(uint8_t address) {
+    // Listen to a single 7-bit address
+    uint32_t samr = LPI2C_SAMR_ADDR0(address);
+    uint32_t address_config = LPI2C_SCFGR1_ADDRCFG(0x0);
+    listen(samr, address_config);
+}
+
+void IMX_RT1060_I2CSlave::listen(uint8_t first_address, uint8_t second_address) {
+    // Listen to 2 7-bit addresses
+    uint32_t samr = LPI2C_SAMR_ADDR0(first_address) | LPI2C_SAMR_ADDR1(second_address);
+    uint32_t address_config = LPI2C_SCFGR1_ADDRCFG(0x02);
+    listen(samr, address_config);
+}
+
+void IMX_RT1060_I2CSlave::listen_range(uint8_t first_address, uint8_t last_address) {
+    // Listen to all 7-bit addresses in the range (inclusive)
+    uint32_t samr = LPI2C_SAMR_ADDR0(first_address) | LPI2C_SAMR_ADDR1(last_address);
+    uint32_t address_config = LPI2C_SCFGR1_ADDRCFG(0x06);
+    listen(samr, address_config);
+}
+
+void IMX_RT1060_I2CSlave::listen(uint32_t samr, uint32_t address_config) {
     // Make sure slave mode is disabled before configuring it.
     stop_listening();
 
-    initialise_common(config);
+    initialise_common(config, pad_control_config);
 
     // Set the Slave Address
-    port->SAMR = address << 1U;
+    port->SAMR = samr;
+
     // Enable clock stretching
-    port->SCFGR1 |= (LPI2C_SCFGR1_TXDSTALL | LPI2C_SCFGR1_RXSTALL);
+    port->SCFGR1 = (address_config | LPI2C_SCFGR1_TXDSTALL | LPI2C_SCFGR1_RXSTALL);
     // Set up interrupts
     attachInterruptVector(config.irq, isr);
-    port->SIER |= (LPI2C_SIER_RSIE | LPI2C_SIER_SDIE | LPI2C_SIER_TDIE | LPI2C_SIER_RDIE);
+    port->SIER = (LPI2C_SIER_RSIE | LPI2C_SIER_SDIE | LPI2C_SIER_TDIE | LPI2C_SIER_RDIE);
     NVIC_ENABLE_IRQ(config.irq);
 
     // Enable Slave Mode
@@ -380,15 +454,15 @@ inline void IMX_RT1060_I2CSlave::stop_listening() {
     stop(port, config.irq);
 }
 
-inline void IMX_RT1060_I2CSlave::after_receive(std::function<void(int len)> callback) {
+inline void IMX_RT1060_I2CSlave::after_receive(std::function<void(size_t len, uint16_t address)> callback) {
     after_receive_callback = callback;
 }
 
-inline void IMX_RT1060_I2CSlave::before_transmit(std::function<void()> callback) {
+inline void IMX_RT1060_I2CSlave::before_transmit(std::function<void(uint16_t address)> callback) {
     before_transmit_callback = callback;
 }
 
-inline void IMX_RT1060_I2CSlave::after_transmit(std::function<void()> callback) {
+inline void IMX_RT1060_I2CSlave::after_transmit(std::function<void(uint16_t address)> callback) {
     after_transmit_callback = callback;
 }
 
@@ -406,8 +480,9 @@ void IMX_RT1060_I2CSlave::_interrupt_service_routine() {
     uint32_t ssr = port->SSR;
 //    log_slave_status_register(ssr);
 
-    if (ssr & LPI2C_SSR_AM0F) {
-        port->SASR; // Read SASR to clear to the address flag. (Just for neatness)
+    if (ssr & LPI2C_SSR_AVF) {
+        // Find out which address was used and clear to the address flag.
+        address_called = (port->SASR & LPI2C_SASR_RADDR(0x7FF)) >> 1;
     }
 
     if (ssr & (LPI2C_SSR_RSF | LPI2C_SSR_SDF)) {
@@ -449,7 +524,7 @@ void IMX_RT1060_I2CSlave::_interrupt_service_routine() {
             _error = I2CError::ok;
             state = State::transmitting;
             if (before_transmit_callback) {
-                before_transmit_callback();
+                before_transmit_callback(address_called);
             }
         }
         if (tx_buffer.initialised()) {
@@ -500,12 +575,12 @@ void IMX_RT1060_I2CSlave::_interrupt_service_routine() {
 void IMX_RT1060_I2CSlave::end_of_frame() {
     if (state == State::receiving) {
         if (after_receive_callback) {
-            after_receive_callback(rx_buffer.get_bytes_written());
+            after_receive_callback(rx_buffer.get_bytes_transferred(), address_called);
         }
     } else if (state == State::transmitting) {
         trailing_byte_sent = false;
         if (after_transmit_callback) {
-            after_transmit_callback();
+            after_transmit_callback(address_called);
         }
     }
     #ifdef DEBUG_I2C
@@ -610,6 +685,7 @@ static void log_master_control_register(const char* message, uint32_t mcr) {
 }
 
 static void log_master_status_register(uint32_t msr) {
+    return;
     if (msr) {
         Serial.print("MSR Flags: ");
     }
